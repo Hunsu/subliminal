@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
-import base64
 import logging
 import os
 import re
-import zlib
 
 from babelfish import Language, language_converters
 from guessit import guessit
-from six.moves.xmlrpc_client import ServerProxy
+from iso639 import languages as langs
+from opensubtitlescom import OpenSubtitles
 
-from . import Provider, TimeoutSafeTransport
+from . import Provider
 from .. import __short_version__
-from ..exceptions import (AuthenticationError, ConfigurationError, DownloadLimitExceeded, ProviderError,
-                          ServiceUnavailable)
+from ..exceptions import (ConfigurationError)
 from ..matches import guess_matches
 from ..subtitle import Subtitle, fix_line_ending
 from ..video import Episode, Movie
@@ -103,6 +101,11 @@ class OpenSubtitlesSubtitle(Subtitle):
         return matches
 
 
+def convert_language_code(three_letter_code):
+    language = langs.get(part3=three_letter_code)
+    return language.alpha2
+
+
 class OpenSubtitlesProvider(Provider):
     """OpenSubtitles Provider.
 
@@ -115,88 +118,58 @@ class OpenSubtitlesProvider(Provider):
     subtitle_class = OpenSubtitlesSubtitle
     user_agent = 'subliminal v%s' % __short_version__
 
-    def __init__(self, username=None, password=None):
-        self.server = ServerProxy(self.server_url, TimeoutSafeTransport(10))
-        if any((username, password)) and not all((username, password)):
-            raise ConfigurationError('Username and password must be specified')
+    def __init__(self, username=None, password=None, api_key=None, app_name=None):
+        if any((username, password, api_key)) and not all((username, password, api_key)):
+            raise ConfigurationError('Username, password and api key must be specified')
         # None values not allowed for logging in, so replace it by ''
         self.username = username or ''
         self.password = password or ''
-        self.token = None
+        self.api_key = api_key or ''
+        self.api = OpenSubtitles(app_name, api_key) or None
 
     def initialize(self):
         logger.info('Logging in')
-        response = checked(self.server.LogIn(self.username, self.password, 'eng', self.user_agent))
-        self.token = response['token']
-        logger.debug('Logged in with token %r', self.token)
+        self.api.login(self.username, self.password)
+        logger.debug('Logged in')
 
     def terminate(self):
         logger.info('Logging out')
-        checked(self.server.LogOut(self.token))
-        self.server.close()
-        self.token = None
+        self.api.logout(self.username, self.password)
         logger.debug('Logged out')
 
-    def no_operation(self):
-        logger.debug('No operation')
-        checked(self.server.NoOperation(self.token))
-
-    def query(self, languages, hash=None, size=None, imdb_id=None, query=None, season=None, episode=None, tag=None):
-        # fill the search criteria
-        criteria = []
-        if hash and size:
-            criteria.append({'moviehash': hash, 'moviebytesize': str(size)})
-        if imdb_id:
-            if season and episode:
-                criteria.append({'imdbid': imdb_id[2:], 'season': season, 'episode': episode})
-            else:
-                criteria.append({'imdbid': imdb_id[2:]})
-        if tag:
-            criteria.append({'tag': tag})
-        if query and season and episode:
-            criteria.append({'query': query.replace('\'', ''), 'season': season, 'episode': episode})
-        elif query:
-            criteria.append({'query': query.replace('\'', '')})
-        if not criteria:
-            raise ValueError('Not enough information')
-
-        # add the language
-        for criterion in criteria:
-            criterion['sublanguageid'] = ','.join(sorted(l.opensubtitles for l in languages))
+    def query(self, wanted_languages, hash=None, size=None, imdb_id=None, query=None, season=None, episode=None,
+              tag=None):
 
         # query the server
-        logger.info('Searching subtitles %r', criteria)
-        response = checked(self.server.SearchSubtitles(self.token, criteria))
+        logger.info('Searching subtitles')
+        response = self.api.search(episode_number=episode, moviehash=hash, query=query, season_number=season,
+                                   imdb_id=imdb_id, languages=','.join(sorted(
+                convert_language_code(lang.opensubtitles) for lang in sorted(wanted_languages))))
         subtitles = []
 
         # exit if no data
-        if not response['data']:
+        if not response.data:
             logger.debug('No subtitles found')
             return subtitles
 
         # loop over subtitle items
-        for subtitle_item in response['data']:
+        for subtitle_item in response.data:
             # read the item
-            language = Language.fromopensubtitles(subtitle_item['SubLanguageID'])
-            hearing_impaired = bool(int(subtitle_item['SubHearingImpaired']))
-            page_link = subtitle_item['SubtitlesLink']
-            subtitle_id = int(subtitle_item['IDSubtitleFile'])
-            matched_by = subtitle_item['MatchedBy']
-            movie_kind = subtitle_item['MovieKind']
-            hash = subtitle_item['MovieHash']
-            movie_name = subtitle_item['MovieName']
-            movie_release_name = subtitle_item['MovieReleaseName']
-            movie_year = int(subtitle_item['MovieYear']) if subtitle_item['MovieYear'] else None
-            movie_imdb_id = 'tt' + subtitle_item['IDMovieImdb']
-            series_season = int(subtitle_item['SeriesSeason']) if subtitle_item['SeriesSeason'] else None
-            series_episode = int(subtitle_item['SeriesEpisode']) if subtitle_item['SeriesEpisode'] else None
-            filename = subtitle_item['SubFileName']
-            encoding = subtitle_item.get('SubEncoding') or None
+            language = Language.fromopensubtitles(subtitle_item.language)
+            hearing_impaired = subtitle_item.hearing_impaired
+            subtitle_id = subtitle_item.file_id
+            movie_name = subtitle_item.movie_name
+            movie_release_name = subtitle_item.release
+            movie_year = subtitle_item.year
+            movie_imdb_id = 'tt' + str(subtitle_item.imdb_id)
+            series_season = subtitle_item.season_number
+            series_episode = subtitle_item.episode_number
+            encoding = "UTF-8"
 
-            subtitle = self.subtitle_class(language, hearing_impaired, page_link, subtitle_id, matched_by, movie_kind,
+            subtitle = self.subtitle_class(language, hearing_impaired, None, subtitle_id, None, None,
                                            hash, movie_name, movie_release_name, movie_year, movie_imdb_id,
-                                           series_season, series_episode, filename, encoding)
-            logger.debug('Found subtitle %r by %s', subtitle, matched_by)
+                                           series_season, series_episode, None, encoding)
+            logger.debug('Found subtitle %r', subtitle)
             subtitles.append(subtitle)
 
         return subtitles
@@ -215,80 +188,5 @@ class OpenSubtitlesProvider(Provider):
 
     def download_subtitle(self, subtitle):
         logger.info('Downloading subtitle %r', subtitle)
-        response = checked(self.server.DownloadSubtitles(self.token, [str(subtitle.subtitle_id)]))
-        subtitle.content = fix_line_ending(zlib.decompress(base64.b64decode(response['data'][0]['data']), 47))
-
-
-class OpenSubtitlesVipSubtitle(OpenSubtitlesSubtitle):
-    """OpenSubtitles Subtitle."""
-    provider_name = 'opensubtitlesvip'
-
-
-class OpenSubtitlesVipProvider(OpenSubtitlesProvider):
-    """OpenSubtitles Provider using VIP url."""
-    server_url = 'https://vip-api.opensubtitles.org/xml-rpc'
-    subtitle_class = OpenSubtitlesVipSubtitle
-
-
-class OpenSubtitlesError(ProviderError):
-    """Base class for non-generic :class:`OpenSubtitlesProvider` exceptions."""
-    pass
-
-
-class Unauthorized(OpenSubtitlesError, AuthenticationError):
-    """Exception raised when status is '401 Unauthorized'."""
-    pass
-
-
-class NoSession(OpenSubtitlesError, AuthenticationError):
-    """Exception raised when status is '406 No session'."""
-    pass
-
-
-class DownloadLimitReached(OpenSubtitlesError, DownloadLimitExceeded):
-    """Exception raised when status is '407 Download limit reached'."""
-    pass
-
-
-class InvalidImdbid(OpenSubtitlesError):
-    """Exception raised when status is '413 Invalid ImdbID'."""
-    pass
-
-
-class UnknownUserAgent(OpenSubtitlesError, AuthenticationError):
-    """Exception raised when status is '414 Unknown User Agent'."""
-    pass
-
-
-class DisabledUserAgent(OpenSubtitlesError, AuthenticationError):
-    """Exception raised when status is '415 Disabled user agent'."""
-    pass
-
-
-def checked(response):
-    """Check a response status before returning it.
-
-    :param response: a response from a XMLRPC call to OpenSubtitles.
-    :return: the response.
-    :raise: :class:`OpenSubtitlesError`
-
-    """
-    status_code = int(response['status'][:3])
-    if status_code == 401:
-        raise Unauthorized
-    if status_code == 406:
-        raise NoSession
-    if status_code == 407:
-        raise DownloadLimitReached
-    if status_code == 413:
-        raise InvalidImdbid
-    if status_code == 414:
-        raise UnknownUserAgent
-    if status_code == 415:
-        raise DisabledUserAgent
-    if status_code == 503:
-        raise ServiceUnavailable
-    if status_code != 200:
-        raise OpenSubtitlesError(response['status'])
-
-    return response
+        response = self.api.download(file_id=subtitle.subtitle_id)
+        subtitle.content = fix_line_ending(response)
